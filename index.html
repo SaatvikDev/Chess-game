@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Chess — Local / AI / Online</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <!-- chessboard.js CSS (CDN) -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/chessboard.js/1.0.0/chessboard-1.0.0.min.css" />
+  <style>
+    body { font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; display:flex; gap:20px; padding:20px; }
+    #left { width: 420px; }
+    #board { width: 400px; }
+    #right { flex:1; min-width:320px; }
+    .panel { background:#fff; border:1px solid #e6e6e6; padding:12px; border-radius:8px; box-shadow:0 6px 24px rgba(20,20,20,0.04); margin-bottom:12px;}
+    button { padding:8px 12px; border-radius:6px; border:1px solid #d0d0d0; background:#f8f8f8; cursor:pointer;}
+    .moves { max-height:240px; overflow:auto; font-family: monospace; white-space:pre; }
+    label { display:block; margin-top:8px; }
+    select,input[type=number] { padding:6px; border-radius:6px; border:1px solid #ddd; }
+    .status { font-weight:600; margin-top:8px; }
+    .small { font-size:13px; color:#666; margin-top:6px; }
+  </style>
+</head>
+<body>
+
+  <div id="left">
+    <div class="panel">
+      <div id="board"></div>
+    </div>
+
+    <div class="panel">
+      <button id="newBtn">New Game</button>
+      <button id="undoBtn">Undo</button>
+      <button id="flipBtn">Flip Board</button>
+      <div class="small">Mode:</div>
+      <label><input type="radio" name="mode" value="local" checked> Local: two players (same device)</label>
+      <label><input type="radio" name="mode" value="ai"> Play vs AI</label>
+      <label><input type="radio" name="mode" value="online"> Online multiplayer (connect below)</label>
+
+      <div id="aiOptions" style="display:none; margin-top:6px;">
+        <label>AI plays as:
+          <select id="aiColor">
+            <option value="black" selected>Black</option>
+            <option value="white">White</option>
+          </select>
+        </label>
+        <label>AI depth (minimax):
+          <input type="number" id="aiDepth" min="1" max="4" value="2" />
+        </label>
+        <div class="small">Higher depth = smarter but slower.</div>
+      </div>
+    </div>
+  </div>
+
+  <div id="right">
+    <div class="panel">
+      <div class="status" id="status">Status: ready</div>
+      <div class="small" id="turnInfo">White to move</div>
+      <div class="small">FEN: <span id="fen">start</span></div>
+      <div style="margin-top:8px;">
+        <strong>Moves:</strong>
+        <div class="moves" id="moves"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <strong>Online / WebSocket</strong>
+      <div style="margin-top:8px;">
+        <label>Server URL:
+          <input type="text" id="serverUrl" value="ws://localhost:8080" style="width:100%" />
+        </label>
+        <label>Choose color when matched:
+          <select id="preferredColor"><option value="random">Random</option><option value="white">White</option><option value="black">Black</option></select>
+        </label>
+        <div style="margin-top:8px;">
+          <button id="connectBtn">Connect</button>
+          <button id="disconnectBtn" disabled>Disconnect</button>
+        </div>
+        <div class="small" id="wsStatus">Not connected</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <strong>Hints / Notes</strong>
+      <ul>
+        <li>Local: drag & drop. Legal moves enforced.</li>
+        <li>AI: uses a material evaluation minimax.</li>
+        <li>Online: run the provided Node server and point Server URL to it. Server pairs players and relays moves.</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- libraries (CDN): chessboard.js and chess.js -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/chessboard.js/1.0.0/chessboard-1.0.0.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/1.0.0/chess.min.js"></script>
+
+  <script>
+    // Initialize chess.js game
+    const game = new Chess(); // from chess.js
+
+    // UI references
+    const statusEl = document.getElementById('status');
+    const turnInfoEl = document.getElementById('turnInfo');
+    const movesEl = document.getElementById('moves');
+    const fenEl = document.getElementById('fen');
+
+    // Mode controls
+    const modeRadios = document.querySelectorAll('input[name="mode"]');
+    const aiOptions = document.getElementById('aiOptions');
+    const aiColorSelect = document.getElementById('aiColor');
+    const aiDepthInput = document.getElementById('aiDepth');
+
+    // WS controls
+    const serverUrlInput = document.getElementById('serverUrl');
+    const connectBtn = document.getElementById('connectBtn');
+    const disconnectBtn = document.getElementById('disconnectBtn');
+    const wsStatus = document.getElementById('wsStatus');
+    const preferredColor = document.getElementById('preferredColor');
+
+    let board = null;
+    let boardOrientation = 'white';
+    let socket = null;
+    let myColor = null; // 'white' or 'black' when connected
+    let isOnline = false;
+
+    // Chessboard config
+    function onDragStart(source, piece, position, orientation) {
+      if (game.game_over()) return false;
+      // If online and not player's turn, block dragging
+      const mode = getMode();
+      if (mode === 'online') {
+        if (!myColor) return false;
+        const turn = game.turn() === 'w' ? 'white' : 'black';
+        if (turn !== myColor) return false;
+      }
+      // If AI mode and it's AI's turn, block
+      if (mode === 'ai') {
+        const aiColor = aiColorSelect.value;
+        const turn = game.turn() === 'w' ? 'white' : 'black';
+        if (turn === aiColor) return false;
+      }
+      // Only allow moving your own pieces (when online restrict by color)
+      if ((piece.search(/^b/) === 0 && game.turn() === 'w') || (piece.search(/^w/) === 0 && game.turn() === 'b')) {
+        // piece color doesn't match side to move
+        return false;
+      }
+    }
+
+    function onDrop(source, target) {
+      // try move on chess.js
+      const move = game.move({ from: source, to: target, promotion: 'q' });
+      if (move === null) return 'snapback';
+      updateStatus();
+      updateBoardAfterMove(move);
+      // If online, send move to server
+      if (getMode() === 'online' && socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type:'move', from: move.from, to: move.to, promotion: move.promotion }));
+      }
+      // If AI mode and it's AI's turn, call AI
+      if (getMode() === 'ai') {
+        window.setTimeout(() => {
+          maybeDoAIMove();
+        }, 200);
+      }
+    }
+
+    function onSnapEnd() {
+      board.position(game.fen());
+    }
+
+    const cfg = {
+      draggable: true,
+      position: 'start',
+      onDragStart,
+      onDrop,
+      onSnapEnd,
+      orientation: boardOrientation
+    };
+    board = Chessboard('board', cfg);
+
+    // Controls
+    document.getElementById('newBtn').addEventListener('click', () => { game.reset(); board.start(); updateStatus(); myColor = null; });
+    document.getElementById('undoBtn').addEventListener('click', () => {
+      game.undo();
+      updateStatus();
+      board.position(game.fen());
+    });
+    document.getElementById('flipBtn').addEventListener('click', () => {
+      boardOrientation = boardOrientation === 'white' ? 'black' : 'white';
+      board.orientation(boardOrientation);
+    });
+
+    // Mode radio handling
+    modeRadios.forEach(r => r.addEventListener('change', () => {
+      const m = getMode();
+      aiOptions.style.display = (m === 'ai') ? 'block' : 'none';
+      if (m === 'ai') maybeDoAIMove();
+    }));
+
+    function getMode() {
+      return document.querySelector('input[name="mode"]:checked').value;
+    }
+
+    // Update status UI
+    function updateStatus() {
+      const status = [];
+      const turn = game.turn() === 'w' ? 'White' : 'Black';
+      if (game.in_checkmate()) {
+        status.push('Checkmate! ' + (turn === 'White' ? 'Black' : 'White') + ' wins.');
+      } else if (game.in_draw()) {
+        status.push('Draw (stalemate or insufficient material or 3fold).');
+      } else {
+        status.push(turn + ' to move.');
+        if (game.in_check()) status.push('Check!');
+      }
+      statusEl.textContent = 'Status: ' + status.join(' ');
+      turnInfoEl.textContent = 'Turn: ' + (game.turn() === 'w' ? 'White' : 'Black');
+      fenEl.textContent = game.fen();
+      // moves list
+      const history = game.history({ verbose: true });
+      let out = '';
+      for (let i=0;i<history.length;i+=2) {
+        const num = Math.floor(i/2)+1;
+        const w = history[i] ? history[i].san : '';
+        const b = history[i+1] ? history[i+1].san : '';
+        out += (num + '. ' + w + ' ' + (b ? b : '') + '\n');
+      }
+      movesEl.textContent = out;
+    }
+
+    updateStatus();
+
+    // Simple material evaluation (weights)
+    function evaluateBoard(chess) {
+      // counts pieces and returns evaluation from white's POV
+      const values = { p:1, n:3, b:3, r:5, q:9, k:0 };
+      let total = 0;
+      const board = chess.board();
+      for (let r = 0; r < 8; r++){
+        for (let f = 0; f < 8; f++){
+          const piece = board[r][f];
+          if (piece) {
+            const sign = piece.color === 'w' ? 1 : -1;
+            total += sign * values[piece.type];
+          }
+        }
+      }
+      return total;
+    }
+
+    // Minimax with alpha-beta (returns best move object)
+    function minimaxRoot(depth, chess, isMaximisingWhite) {
+      const moves = chess.moves({ verbose: true });
+      let bestMove = null;
+      let bestValue = isMaximisingWhite ? -Infinity : Infinity;
+
+      for (let i=0;i<moves.length;i++){
+        const move = moves[i];
+        chess.move(move);
+        const value = minimax(depth-1, chess, -Infinity, Infinity, !isMaximisingWhite);
+        chess.undo();
+        if (isMaximisingWhite) {
+          if (value > bestValue) { bestValue = value; bestMove = move; }
+        } else {
+          if (value < bestValue) { bestValue = value; bestMove = move; }
+        }
+      }
+      return bestMove;
+    }
+
+    function minimax(depth, chess, alpha, beta, isMaximisingWhite) {
+      if (depth === 0) return evaluateBoard(chess);
+      const moves = chess.moves({ verbose: true });
+      if (isMaximisingWhite) {
+        let maxEval = -Infinity;
+        for (let i=0;i<moves.length;i++){
+          chess.move(moves[i]);
+          const evalv = minimax(depth-1, chess, alpha, beta, false);
+          chess.undo();
+          maxEval = Math.max(maxEval, evalv);
+          alpha = Math.max(alpha, evalv);
+          if (beta <= alpha) break;
+        }
+        return maxEval;
+      } else {
+        let minEval = Infinity;
+        for (let i=0;i<moves.length;i++){
+          chess.move(moves[i]);
+          const evalv = minimax(depth-1, chess, alpha, beta, true);
+          chess.undo();
+          minEval = Math.min(minEval, evalv);
+          beta = Math.min(beta, evalv);
+          if (beta <= alpha) break;
+        }
+        return minEval;
+      }
+    }
+
+    // Ask AI to move if it's AI's turn
+    function maybeDoAIMove() {
+      if (getMode() !== 'ai') return;
+      if (game.game_over()) return;
+      const aiColor = aiColorSelect.value; // 'black' or 'white'
+      const turnColor = game.turn() === 'w' ? 'white' : 'black';
+      if (turnColor !== aiColor) return; // not AI's turn
+      statusEl.textContent = 'Status: AI thinking...';
+      const depth = parseInt(aiDepthInput.value) || 2;
+      // run minimax (synchronous)
+      const isMaxWhite = (aiColor === 'white');
+      const best = minimaxRoot(depth, game, isMaxWhite);
+      if (best) {
+        game.move(best.san);
+        updateStatus();
+        board.position(game.fen());
+        updateBoardAfterMove(best);
+      }
+    }
+
+    // Called when a move has been made (move object or {from,to})
+    function updateBoardAfterMove(move) {
+      board.position(game.fen());
+    }
+
+    // WebSocket online logic (simple pairing + relaying)
+    connectBtn.addEventListener('click', () => {
+      const url = serverUrlInput.value.trim();
+      if (!url) return alert('Enter server WebSocket URL');
+      try {
+        socket = new WebSocket(url);
+      } catch (e) { alert('Invalid URL'); return; }
+      socket.onopen = () => {
+        wsStatus.textContent = 'Connected — waiting to be paired...';
+        connectBtn.disabled = true;
+        disconnectBtn.disabled = false;
+        isOnline = true;
+        // send a join request with preferred color
+        socket.send(JSON.stringify({ type:'join', preferred: preferredColor.value }));
+      };
+      socket.onmessage = (ev) => {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === 'paired') {
+          wsStatus.textContent = 'Paired — you are ' + msg.color;
+          myColor = msg.color;
+          // reset a fresh game
+          game.reset();
+          board.start();
+          board.orientation(myColor); // show board oriented to you
+          updateStatus();
+          // If AI or local radios set, switch to online mode
+          document.querySelector('input[name="mode"][value="online"]').checked = true;
+        } else if (msg.type === 'move') {
+          // opponent moved: apply move
+          game.move({ from: msg.from, to: msg.to, promotion: msg.promotion || 'q' });
+          updateStatus();
+          board.position(game.fen());
+        } else if (msg.type === 'info') {
+          wsStatus.textContent = msg.text;
+        }
+      };
+      socket.onclose = () => {
+        wsStatus.textContent = 'Disconnected';
+        connectBtn.disabled = false;
+        disconnectBtn.disabled = true;
+        isOnline = false;
+        myColor = null;
+      };
+      socket.onerror = (e) => {
+        wsStatus.textContent = 'Error connecting';
+        console.error(e);
+      };
+    });
+
+    disconnectBtn.addEventListener('click', () => {
+      if (socket) socket.close();
+      socket = null;
+      connectBtn.disabled = false;
+      disconnectBtn.disabled = true;
+      wsStatus.textContent = 'Not connected';
+      myColor = null;
+    });
+
+    // When page loads and mode is ai, check if AI should move as white
+    window.addEventListener('load', () => {
+      if (getMode() === 'ai') maybeDoAIMove();
+    });
+
+    // Ensure board snaps correctly after resizing etc.
+    window.addEventListener('resize', () => board.resize());
+  </script>
+</body>
+</html>
+
